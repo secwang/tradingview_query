@@ -6,20 +6,20 @@ import webbrowser
 import urllib.parse
 from datetime import datetime
 from playwright.sync_api import sync_playwright
-from PIL import Image, ImageStat  # 用于检查图片质量
+from PIL import Image, ImageStat  # pip install Pillow
 
 # ================= 配置区 =================
 WATCHLIST_URL = "https://www.tradingview.com/watchlists/191753745/"
 USER_DATA_DIR = os.path.abspath("tv_user_data")
 BASE_DIR = os.path.abspath("TradingView_Reports")
 
-# 强制不隐藏窗口，确保 WebGL 稳定
+# 自动运行模式是否隐藏窗口
 HEADLESS_IN_AUTO = False 
 
-# 基础配置
-LOAD_WAIT_TIME = 12   # 初始等待时间 (秒)
-MAX_RETRIES = 3       # 每个图层最多尝试 3 次
-MIN_FILE_SIZE = 30000 # 最小文件大小 (30KB)，小于此值判定为坏图
+# 核心效率配置
+LOAD_WAIT_TIME = 6    # 初始等待6秒
+MAX_RETRIES = 3       # 失败后最多试3次
+MIN_FILE_SIZE = 25000 # 25KB
 
 INTERVALS = {
     "Daily": "D",
@@ -30,32 +30,21 @@ INTERVALS = {
 # =========================================
 
 def format_duration(seconds):
+    """格式化秒数为 分:秒"""
     mins, secs = divmod(int(seconds), 60)
     return f"{mins}分{secs}秒" if mins > 0 else f"{secs}秒"
 
 def is_image_bad(img_path):
-    """
-    检查图片是否异常：
-    1. 文件太小 (通常是没加载出来)
-    2. 颜色太单一 (标准差太低通常是全白、全黑或只有一个加载圆圈)
-    """
+    """通过像素分析检查图片是否为转圈或空白"""
     try:
         if not os.path.exists(img_path): return True
-        # 1. 检查文件大小
-        if os.path.getsize(img_path) < MIN_FILE_SIZE:
-            return True 
-        
-        # 2. 检查颜色分布 (标准差)
+        if os.path.getsize(img_path) < MIN_FILE_SIZE: return True
         with Image.open(img_path) as img:
-            # 转换为灰度图计算像素分布
             stat = ImageStat.Stat(img.convert('L'))
             stddev = stat.stddev[0]
-            # 标准差 < 8 通常意味着图片几乎是纯色的（空白或只有极少量像素）
-            if stddev < 8:
-                return True
+            if stddev < 8: return True 
         return False
-    except Exception as e:
-        print(f"   ⚠️ 图片分析出错: {e}")
+    except:
         return True
 
 def parse_tv_symbol(href):
@@ -73,14 +62,14 @@ def parse_tv_symbol(href):
 
 def fetch_symbols(page):
     print(f"📡 正在同步 Watchlist 列表...")
-    page.goto(WATCHLIST_URL, wait_until="domcontentloaded", timeout=90000)
+    page.goto(WATCHLIST_URL, wait_until="domcontentloaded", timeout=60000)
     try:
-        page.wait_for_selector('[data-qa-id="column-symbol"]', timeout=45000)
+        page.wait_for_selector('[data-qa-id="column-symbol"]', timeout=30000)
     except:
-        print("❌ 未能加载列表，请检查网络。")
+        print("❌ 未能加载列表。")
         return []
-    page.mouse.wheel(0, 5000)
-    time.sleep(3)
+    page.mouse.wheel(0, 3000)
+    time.sleep(2)
     links = page.query_selector_all('[data-qa-id="column-symbol"] a')
     symbols = []
     for link in links:
@@ -105,12 +94,12 @@ def generate_standard_html(symbols):
             .symbol-title {{ font-size: 22px; margin-bottom: 20px; border-left: 6px solid #2962ff; padding-left: 15px; font-weight: bold; }}
             .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(600px, 1fr)); gap: 20px; }}
             .card {{ background: #fff; border-radius: 8px; overflow: hidden; border: 1px solid #e0e3eb; }}
-            .card img {{ width: 100%; display: block; cursor: pointer; }}
+            .card img {{ width: 100%; display: block; }}
             .card-label {{ padding: 10px; text-align: center; font-size: 13px; font-weight: 600; color: #434651; background: #f8f9fb; }}
         </style>
     </head>
     <body>
-        <h1 style="text-align:center;">市场全景复盘报告</h1>
+        <h1 style="text-align:center;">市场复盘报告</h1>
         <div class="nav">
             <a href="#watchlist_quotes">📋 报价单</a>
             {" ".join([f'<a href="#{s.replace(":", "_")}">{s.split(":")[-1]}</a>' for s in symbols])}
@@ -125,22 +114,87 @@ def generate_standard_html(symbols):
         for name in INTERVALS.keys():
             html_template += f'<div class="card"><img src="{s_id}/{name}.png" onclick="window.open(this.src)"><div class="card-label">{name}</div></div>'
         html_template += "</div></div>"
-    html_template += f"<p style='text-align:center; color:#999;'>更新时间: {now_str}</p></body></html>"
+    html_template += f"<p style='text-align:center; color:#999;'>Updated: {now_str}</p></body></html>"
     
     path = os.path.join(BASE_DIR, "index.html")
+    with open(path, "w", encoding="utf-8") as f: f.write(html_template)
+    return path
+
+def generate_pdf_html(symbols):
+    now_full = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    html_template = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            @page {{ size: A4 landscape; margin: 0; }}
+            * {{ box-sizing: border-box; -webkit-print-color-adjust: exact; }}
+            body {{ margin: 0; padding: 0; background: #fff; width: 297mm; font-family: sans-serif; }}
+            .page {{ 
+                width: 297mm; height: 210mm; 
+                page-break-after: always; padding: 10mm 15mm; 
+                display: flex; flex-direction: column; position: relative; overflow: hidden;
+            }}
+            .symbol-title {{ 
+                font-size: 22px; color: #2962ff; border-left: 5px solid #2962ff; 
+                padding-left: 12px; margin-bottom: 10px; font-weight: bold; 
+            }}
+            .grid {{ display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 10px; flex: 1; }}
+            .card {{ border: 1px solid #d1d4dc; border-radius: 6px; display: flex; flex-direction: column; overflow: hidden; }}
+            .card img {{ width: 100%; height: 88%; object-fit: contain; background: #fafafa; }}
+            .card-label {{ height: 12%; text-align: center; font-size: 11px; background: #f8f9fb; font-weight: bold; display: flex; align-items: center; justify-content: center; border-top: 1px solid #d1d4dc; }}
+            .cover {{ 
+                display: flex; flex-direction: column; align-items: center; justify-content: center; 
+                height: 100%; border: 2px solid #2962ff; margin: 10px; border-radius: 10px;
+            }}
+        </style>
+    </head>
+    <body>
+        <!-- 封面页 -->
+        <div class="page">
+            <div class="cover">
+                <h1 style="font-size: 48px; color: #131722; margin-bottom: 10px;">市场全景复盘报告</h1>
+                <p style="font-size: 20px; color: #666; margin-bottom: 30px;">TradingView Automated Landscape Report</p>
+                <div style="text-align: center; color: #999; font-size: 14px;">
+                    生成时间: {now_full} <br>
+                    品种总数: {len(symbols)}
+                </div>
+            </div>
+        </div>
+
+        <!-- 报价单页 -->
+        <div class="page">
+            <div class="symbol-title">实时报价概览 (Watchlist)</div>
+            <div style="flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden;">
+                <img src="00_Watchlist_Quotes.png" style="max-width: 95%; max-height: 90%; object-fit: contain; border: 1px solid #d1d4dc;" onerror="this.style.display='none'">
+            </div>
+        </div>
+    """
+    for symbol in symbols:
+        s_id = symbol.replace(":", "_")
+        html_template += f"""<div class="page">
+            <div class="symbol-title">{symbol} 趋势全景</div>
+            <div class="grid">"""
+        for name in INTERVALS.keys():
+            html_template += f'<div class="card"><img src="{s_id}/{name}.png"><div class="card-label">{name} Chart</div></div>'
+        html_template += "</div></div>"
+    
+    html_template += "</body></html>"
+    path = os.path.join(BASE_DIR, "pdf_template.html")
     with open(path, "w", encoding="utf-8") as f: f.write(html_template)
     return path
 
 def main():
     start_all = time.time()
     args = [a.lower() for a in sys.argv]
-    
+    is_setup, need_pdf = "setup" in args, "pdf" in args
+
     if "clean" in args:
         if os.path.exists(USER_DATA_DIR): shutil.rmtree(USER_DATA_DIR)
         if os.path.exists(BASE_DIR): shutil.rmtree(BASE_DIR)
-        print("✅ 缓存目录已清理。"); return
+        print("✅ 目录已清理。"); return
 
-    is_setup = "setup" in args
     if not os.path.exists(BASE_DIR): os.makedirs(BASE_DIR)
 
     with sync_playwright() as p:
@@ -153,14 +207,11 @@ def main():
         
         if is_setup:
             page.goto("https://www.tradingview.com/", wait_until="domcontentloaded")
-            input("💡 [Setup模式] 请登录并调整好图表布局，完成后在此按回车继续...")
+            input("💡 [Setup] 调整好后回车...")
         
-        # 1. 获取列表
+        # 1. 同步列表
         all_symbols = fetch_symbols(page)
-        if not all_symbols: 
-            print("❌ 未获取到品种，程序终止。")
-            context.close()
-            return
+        if not all_symbols: context.close(); return
 
         # 2. 截图报价单
         print("📸 正在截取报价单...")
@@ -171,10 +222,10 @@ def main():
             page.locator(".layout__area--right").screenshot(path=os.path.join(BASE_DIR, "00_Watchlist_Quotes.png"))
         except: pass
 
-        # 3. 品种循环截图 (带质量自检重试)
+        # 3. 循环截图
         t2 = time.time()
         for i, symbol in enumerate(all_symbols):
-            print(f"📸 [{i+1}/{len(all_symbols)}] 处理品种: {symbol}")
+            print(f"📸 [{i+1}/{len(all_symbols)}] 处理: {symbol}")
             s_folder = os.path.join(BASE_DIR, symbol.replace(":", "_"))
             os.makedirs(s_folder, exist_ok=True)
             
@@ -182,41 +233,49 @@ def main():
                 url = f"https://www.tradingview.com/chart/?symbol={symbol}&interval={inv}"
                 save_path = os.path.join(s_folder, f"{name}.png")
                 
-                # --- 重试逻辑开始 ---
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
                         page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                        page.wait_for_selector(".chart-container-border", timeout=30000)
-                        
-                        # 物理唤醒：点击图表中心并稍微等待渲染
+                        page.wait_for_selector(".chart-container-border", timeout=20000)
                         page.mouse.click(600, 500)
                         
-                        # 阶梯式等待时间 (第一次12s, 第二次17s, 第三次22s)
-                        current_wait = LOAD_WAIT_TIME + (attempt - 1) * 5
-                        time.sleep(current_wait)
-                        
-                        # 执行截图
+                        time.sleep(LOAD_WAIT_TIME * attempt) # 阶梯式等待
                         page.locator(".chart-container-border").screenshot(path=save_path)
                         
-                        # 检查图片是否合格
                         if not is_image_bad(save_path):
-                            if attempt > 1: print(f"   ✅ 第 {attempt} 次重试成功")
-                            break # 图片合格，跳出重试循环
+                            if attempt > 1: print(f"   ✅ 第 {attempt} 次重试抓取成功")
+                            break
                         else:
-                            print(f"   ⚠️ 第 {attempt} 次截图质量差(转圈或空白)，正在重试...")
-                            if attempt == MAX_RETRIES:
-                                print(f"   ❌ 已达到最大重试次数，可能网络确实太慢。")
+                            print(f"   ⚠️ 第 {attempt} 次尝试图像异常，正在重试...")
                     except Exception as e:
-                        print(f"   ❌ 第 {attempt} 次尝试异常: {str(e)[:40]}")
-                # --- 重试逻辑结束 ---
-            
-        print(f"⏱️ 截图任务完成，耗时: {format_duration(time.time()-t2)}")
-        context.close()
+                        print(f"   ❌ 第 {attempt} 次异常: {str(e)[:30]}")
+        
+        print(f"⏱️ 截图耗时: {format_duration(time.time()-t2)}")
+        
+        # 4. 报告生成
+        generate_standard_html(all_symbols)
+        if need_pdf:
+            print("🖨️ 正在导出 PDF (包含首页和 Watchlist)...")
+            pdf_html = generate_pdf_html(all_symbols)
+            pdf_path = os.path.join(BASE_DIR, f"Report_{datetime.now().strftime('%m%d_%H%M')}.pdf")
+            pdf_page = context.new_page()
+            pdf_page.goto(f"file://{pdf_html}", wait_until="networkidle")
+            time.sleep(3) # 给图片一点加载时间
+            pdf_page.pdf(
+                path=pdf_path, 
+                format="A4", 
+                landscape=True, 
+                print_background=True,
+                margin={"top": "0in", "bottom": "0in", "left": "0in", "right": "0in"}
+            )
+            print(f"🏁 PDF 已生成: {pdf_path}")
+            webbrowser.open(f"file://{pdf_path}")
+        else:
+            print(f"🏁 Web报告已生成: {os.path.join(BASE_DIR, 'index.html')}")
+            webbrowser.open(f"file://{os.path.join(BASE_DIR, 'index.html')}")
 
-    # 4. 报告生成
-    web_path = generate_standard_html(all_symbols)
-    print(f"🏁 【全部完成】总运行耗时: {format_duration(time.time()-start_all)}")
-    webbrowser.open(f"file://{web_path}")
+        context.close()
+        print(f"✨ 总耗时: {format_duration(time.time()-start_all)}")
 
 if __name__ == "__main__":
     main()
