@@ -5,5 +5,8 @@ test_pdf_full.py
 test_pdf_size.py
 tv_state.json
 tv_user_data/
+TradingView_Archive/
+tv_cache/
+tv_archive/
 
 
