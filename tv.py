@@ -137,8 +137,7 @@ async def shot_wl(pg, hl):
                     if bb: await pg.screenshot(path=out, clip=bb); return
                 else: await loc.screenshot(path=out); return
         await pg.screenshot(path=out)
-    except Exception as e:
-        print(f"⚠️ 报价单截图失败: {e}")
+    except Exception as e: print(f"⚠️ 报价单截图失败: {e}")
 
 # ================= 报告系统 =================
 
@@ -187,18 +186,8 @@ body{{margin:0;padding:0;background:#fff;width:297mm;font-family:sans-serif}}
 .card-label{{height:12%;text-align:center;font-size:11px;background:#f8f9fb;display:flex;align-items:center;justify-content:center;border-top:1px solid #d1d4dc}}
 .cover{{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;border:2px solid #2962ff;margin:10px;border-radius:10px}}
 </style></head><body>
-<!-- 封面 -->
 <div class="page"><div class="cover"><h1 style="font-size:48px;margin-bottom:10px;">市场复盘报告</h1><p style="font-size:20px;color:#666;">TradingView Automated Report</p><div style="color:#999;margin-top:20px;">生成时间: {now}</div></div></div>
-
-<!-- 新增：报价单概览页 -->
-<div class="page">
-    <div class="symbol-title">实时报价概览 (Watchlist)</div>
-    <div style="flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; padding:20px;">
-        <img src="00_Watchlist_Quotes.png" style="max-height:100%; border:1px solid #d1d4dc; border-radius:4px;" onerror="this.style.display='none'">
-    </div>
-</div>
-
-<!-- 品种详情页 -->
+<div class="page"><div class="symbol-title">实时报价概览 (Watchlist)</div><div style="flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:20px;"><img src="00_Watchlist_Quotes.png" style="max-height:100%;border:1px solid #d1d4dc;border-radius:4px;" onerror="this.style.display='none'"></div></div>
 {''.join(map(psec, ss))}
 </body></html>"""
 
