@@ -1,116 +1,182 @@
-import os,sys,time,shutil,webbrowser,urllib.parse,argparse
+import os, sys, time, shutil, webbrowser, urllib.parse, argparse, asyncio, random
 from datetime import datetime
-from playwright.sync_api import sync_playwright
-from PIL import Image,ImageStat
+from playwright.async_api import async_playwright
+from PIL import Image, ImageStat
 
-WL="https://www.tradingview.com/watchlists/191753745/"
-UD=os.path.abspath("tv_user_data")
-BD=os.path.abspath("TradingView_Reports")
-LW,MR,MF=8,3,25000
-IV={"Daily":"D","Weekly":"W","Monthly":"M","Yearly":"12M"}
+# ================= 配置区 =================
 
-dur=lambda s:f"{s//60}分{s%60}秒" if s>=60 else f"{s}秒"
+WL = "https://www.tradingview.com/watchlists/191753745/"
+UD = os.path.abspath("tv_user_data")
+BD = os.path.abspath("TradingView_Reports")
+LW, MR, MF = 8, 3, 25000  # 基础等待秒, 最大重试次数, 最小字节校验
+IV = {"Daily": "D", "Weekly": "W", "Monthly": "M", "Yearly": "12M"}
+CONCURRENCY = 3  # 并发限制数
+
+# 浏览器启动参数
+
+HL_ARGS = ['--headless=new', '--use-gl=swiftshader', '--enable-webgl', '--ignore-gpu-blocklist', '--disable-gpu-sandbox']
+BASE_ARGS = ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--no-sandbox']
+CHART_JS = "()=>{const c=document.querySelectorAll('canvas');return c.length>2&&!!document.querySelector('.price-axis,.paneWrapper');}"
+
+# ================= 辅助工具 =================
+
+dur = lambda s: f"{s//60}分{s%60}秒" if s >= 60 else f"{s}秒"
+get_wait = lambda base: max(2, base + random.uniform(-1.5, 2.5))
+
+class Progress:
+    """终端进度条管理"""
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.lock = asyncio.Lock()
+
+    async def update(self, s, n, status="✅"):
+        async with self.lock:
+            self.done += 1
+            pct = (self.done / self.total) * 100
+            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            sys.stdout.write(f"\r🚀 进度: |{bar}| {pct:.1f}% ({self.done}/{self.total}) | {status} {s} {n}    ")
+            sys.stdout.flush()
+            if self.done == self.total: print("\n✨ 所有截图任务已完成")
 
 def bad(p):
+    """检查图片是否加载失败（全黑、全白或文件过小）"""
     try:
-        if not os.path.exists(p) or os.path.getsize(p)<MF:return True
-        with Image.open(p) as i:return ImageStat.Stat(i.convert('L')).stddev[0]<8
-    except:return True
+        if not os.path.exists(p) or os.path.getsize(p) < MF: return True
+        with Image.open(p) as i:
+            return ImageStat.Stat(i.convert('L')).stddev[0] < 8
+    except: return True
 
 def sym(h):
-    if not h:return None
-    u=urllib.parse.urlparse(h);ps=[p for p in u.path.split('/') if p]
-    if len(ps)<2:return None
-    t=ps[1];q=urllib.parse.parse_qs(u.query)
-    return f"{q['exchange'][0]}:{t}" if 'exchange' in q else t.replace("-",":",1) if "-" in t else f"TVC:{t}"
+    """从URL中解析品种代码"""
+    if not h: return None
+    u = urllib.parse.urlparse(h); ps = [p for p in u.path.split('/') if p]
+    if len(ps) < 2: return None
+    t = ps[1]; q = urllib.parse.parse_qs(u.query)
+    return f"{q['exchange'][0]}:{t}" if 'exchange' in q else t.replace("-", ":", 1) if "-" in t else f"TVC:{t}"
 
-def fetch(pg):
+# ================= 网页操作 =================
+
+async def fetch(pg):
     print("📡 正在同步 Watchlist 列表...")
-    pg.goto(WL,wait_until="domcontentloaded",timeout=60000)
-    try:pg.wait_for_selector('[data-qa-id="column-symbol"]',timeout=30000)
-    except:print("❌ 未能加载列表。");return[]
-    pg.mouse.wheel(0,3000);time.sleep(2)
-    ss=[sym(a.get_attribute("href")) for a in pg.query_selector_all('[data-qa-id="column-symbol"] a')]
-    r=list(dict.fromkeys(s for s in ss if s))
-    print(f"✅ 共获取 {len(r)} 个品种");return r
-
-CHART_JS="()=>{const c=document.querySelectorAll('canvas');return c.length>2&&!!document.querySelector('.price-axis,.paneWrapper');}"
-
-def wait_chart(pg,hl):
-    try:pg.wait_for_selector(".chart-container-border",timeout=15000,state="attached")
-    except:pass
-    if hl:
-        try:pg.wait_for_function(CHART_JS,timeout=20000,polling=500)
-        except:pass
-        time.sleep(3)
-
-def screenshot(pg,p,hl):
-    """headless 优先 bounding_box 裁剪，普通模式直接元素截图"""
-    loc=pg.locator(".chart-container-border")
-    if hl:
-        bb=loc.bounding_box() if loc.count()>0 else None
-        pg.screenshot(path=p,clip=bb) if bb else pg.screenshot(path=p)
-    else:
-        loc.screenshot(path=p)
-
-def shot(pg,s,n,iv,sf,hl,idx,total):
-    p=os.path.join(sf,f"{n}.png")
-    for a in range(1,MR+1):
-        try:
-            pg.goto(f"https://www.tradingview.com/chart/?symbol={s}&interval={iv}",wait_until="domcontentloaded",timeout=60000)
-            wait_chart(pg,hl)
-            pg.mouse.move(10,10);time.sleep(LW*a)
-            screenshot(pg,p,hl)
-            if not bad(p):
-                if a>1:print(f"   ✅ [{idx}/{total}] 第{a}次重试成功")
-                return
-            print(f"   ⚠️ [{idx}/{total}] {s}/{n} 第{a}次图像异常，重试...")
-        except Exception as e:
-            print(f"   ❌ [{idx}/{total}] {s}/{n} 第{a}次异常: {str(e)[:60]}")
-    print(f"   💀 [{idx}/{total}] {s}/{n} 全部重试失败，跳过")
-
-def shot_wl(pg,hl):
-    print("📸 正在截取精简 Watchlist...")
-    pg.goto("https://www.tradingview.com/chart/",wait_until="domcontentloaded");time.sleep(10)
+    await pg.goto(WL, wait_until="domcontentloaded", timeout=60000)
     try:
-        pg.add_style_tag(content="[data-name='details-pane'],[data-name='news-pane'],.resizer-3_ve2S35{border:none!important}.button-4m6_9f_9{display:none!important}")
-        out=os.path.join(BD,"00_Watchlist_Quotes.png")
-        for sel in[".widgetbar-widget-watchlist",".layout__area--right"]:
-            loc=pg.locator(sel)
-            if loc.count()>0:
+        await pg.wait_for_selector('[data-qa-id="column-symbol"]', timeout=30000)
+    except:
+        print("❌ 未能加载列表，请检查网络或 URL。"); return []
+    await pg.mouse.wheel(0, 3000); await asyncio.sleep(2)
+    elements = await pg.query_selector_all('[data-qa-id="column-symbol"] a')
+    ss = [sym(await a.get_attribute("href")) for a in elements]
+    r = list(dict.fromkeys(s for s in ss if s))
+    print(f"✅ 共获取 {len(r)} 个品种")
+    return r
+
+async def wait_chart(pg, hl):
+    """等待图表 Canvas 渲染完成"""
+    try: await pg.wait_for_selector(".chart-container-border", timeout=15000, state="attached")
+    except: pass
+    if hl:
+        try: await pg.wait_for_function(CHART_JS, timeout=20000, polling=500)
+        except: pass
+    await asyncio.sleep(get_wait(3))
+
+async def screenshot(pg, p, hl):
+    """截图：无头模式用裁剪，有头模式用元素截图"""
+    loc = pg.locator(".chart-container-border")
+    if hl:
+        bb = await loc.bounding_box() if await loc.count() > 0 else None
+        if bb: await pg.screenshot(path=p, clip=bb)
+        else: await pg.screenshot(path=p)
+    else:
+        await loc.screenshot(path=p)
+
+async def shot_task(sem, ctx, s, n, iv, sf, hl, progress):
+    """核心截图工作流"""
+    async with sem:
+        p = os.path.join(sf, f"{n}.png")
+        pg = await ctx.new_page()
+        success = False
+        try:
+            for a in range(1, MR + 1):
+                try:
+                    # 错峰进入
+                    if a == 1: await asyncio.sleep(random.uniform(0, 3))
+
+                    await pg.goto(f"https://www.tradingview.com/chart/?symbol={s}&interval={iv}",
+                                  wait_until="domcontentloaded", timeout=60000)
+                    await wait_chart(pg, hl)
+                    await pg.mouse.move(10, 10)
+
+                    # 随机抖动等待加载
+                    await asyncio.sleep(get_wait(LW * a))
+
+                    await screenshot(pg, p, hl)
+                    if not bad(p):
+                        success = True; break
+                except Exception:
+                    continue
+
+            await progress.update(s, n, "✅" if success else "💀")
+        finally:
+            await pg.close()
+
+async def shot_wl(pg, hl):
+    """截取右侧报价单概览"""
+    print("📸 正在截取报价单概览...")
+    await pg.goto("https://www.tradingview.com/chart/", wait_until="domcontentloaded")
+    await asyncio.sleep(get_wait(10))
+    try:
+        # 隐藏多余按钮和边框
+        await pg.add_style_tag(content="[data-name='details-pane'],[data-name='news-pane'],.resizer-3_ve2S35{border:none!important}.button-4m6_9f_9{display:none!important}")
+        out = os.path.join(BD, "00_Watchlist_Quotes.png")
+        for sel in [".widgetbar-widget-watchlist", ".layout__area--right"]:
+            loc = pg.locator(sel)
+            if await loc.count() > 0:
                 if hl:
-                    bb=loc.bounding_box()
-                    if bb:pg.screenshot(path=out,clip=bb);return
-                else:loc.screenshot(path=out);return
-        pg.screenshot(path=out)
-    except Exception as e:print(f"   ⚠️ Watchlist 截图失败: {e}")
+                    bb = await loc.bounding_box()
+                    if bb: await pg.screenshot(path=out, clip=bb); return
+                else: await loc.screenshot(path=out); return
+        await pg.screenshot(path=out)
+    except Exception as e:
+        print(f"⚠️ 报价单截图失败: {e}")
 
-card =lambda sid,n:f'<div class="card"><img src="{sid}/{n}.png" onclick="window.open(this.src)"><div class="card-label">{n}</div></div>'
-pcard=lambda sid,n:f'<div class="card"><img src="{sid}/{n}.png"><div class="card-label">{n} Chart</div></div>'
-sec  =lambda s:f'<div class="symbol-section" id="{s.replace(":","_")}"><div class="symbol-title">{s}</div><div class="grid">{"".join(card(s.replace(":","_"),n) for n in IV)}</div></div>'
-psec =lambda s:f'<div class="page"><div class="symbol-title">{s} 趋势全景</div><div class="grid">{"".join(pcard(s.replace(":","_"),n) for n in IV)}</div></div>'
+# ================= 报告系统 =================
 
-def html(ss):
-    nav=''.join(f'<a href="#{s.replace(":","_")}">{s.split(":")[-1]}</a>' for s in ss)
-    body=f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>复盘报告</title><style>
+def gen_html(ss):
+    """生成 Web 浏览报告"""
+    nav = ''.join(f'<a href="#{s.replace(":","")}">{s.split(":")[-1]}</a>' for s in ss)
+    card = lambda sid, n: f'<div class="card"><img src="{sid}/{n}.png" onclick="window.open(this.src)"><div class="card-label">{n}</div></div>'
+    sec = lambda s: f'<div class="symbol-section" id="{s.replace(":","")}"><div class="symbol-title">{s}</div><div class="grid">{"".join(card(s.replace(":","_"), n) for n in IV)}</div></div>'
+
+    body = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>自动化复盘报告</title><style>
 body{{font-family:-apple-system,sans-serif;background:#f2f4f7;margin:0;padding:20px}}
 .nav{{position:sticky;top:0;background:rgba(255,255,255,.9);backdrop-filter:blur(8px);padding:12px;z-index:100;border-bottom:1px solid #d1d4dc;margin-bottom:30px;text-align:center}}
 .nav a{{color:#2962ff;margin:0 10px;text-decoration:none;font-size:13px;font-weight:bold;padding:5px 10px;border-radius:4px}}
 .symbol-section{{margin-bottom:40px;padding:25px;border-radius:12px;background:#fff;border:1px solid #e0e3eb}}
 .symbol-title{{font-size:22px;margin-bottom:20px;border-left:6px solid #2962ff;padding-left:15px;font-weight:bold}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(600px,1fr));gap:20px}}
-.card{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e0e3eb}}
-.card img{{width:100%;display:block}}.card-label{{padding:10px;text-align:center;font-size:13px;font-weight:600;background:#f8f9fb}}
-</style></head><body><h1 style="text-align:center;">市场复盘报告</h1>
-<div class="nav"><a href="#watchlist_quotes">📋 报价单</a>{nav}</div>
+.card{{background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e0e3eb;transition:0.2s}}
+.card:hover{{box-shadow:0 4px 12px rgba(0,0,0,.1)}}
+.card img{{width:100%;display:block;cursor:pointer}}
+.card-label{{padding:10px;text-align:center;font-size:13px;font-weight:600;background:#f8f9fb}}
+</style></head><body><h1 style="text-align:center;">市场全景复盘报告</h1>
+<div class="nav"><a href="#watchlist_quotes">📋 报价概览</a>{nav}</div>
 <div style="text-align:center;margin-bottom:40px;"><img id="watchlist_quotes" src="00_Watchlist_Quotes.png" style="max-width:450px;border:1px solid #ddd;border-radius:8px;" onerror="this.style.display='none'"></div>
-{''.join(map(sec,ss))}<p style="text-align:center;color:#999;">Updated:{datetime.now().strftime('%Y-%m-%d %H:%M')}</p></body></html>"""
-    open(os.path.join(BD,"index.html"),"w",encoding="utf-8").write(body)
-    return os.path.join(BD,"index.html")
+{''.join(map(sec, ss))}
+<p style="text-align:center;color:#999;margin-top:50px;">生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p></body></html>"""
 
-def phtml(ss):
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    body=f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+    p = os.path.join(BD, "index.html")
+    with open(p, "w", encoding="utf-8") as f: f.write(body)
+    return p
+
+async def export_pdf(ctx, ss):
+    """生成 PDF 专用模板并导出"""
+    print("🖨️ 正在导出 PDF 打印版...")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    pcard = lambda sid, n: f'<div class="card"><img src="{sid}/{n}.png"><div class="card-label">{n} Chart</div></div>'
+    psec = lambda s: f'<div class="page"><div class="symbol-title">{s} 趋势全景</div><div class="grid">{"".join(pcard(s.replace(":","_"),n) for n in IV)}</div></div>'
+
+    body = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 @page{{size:A4 landscape;margin:0}}*{{box-sizing:border-box;-webkit-print-color-adjust:exact}}
 body{{margin:0;padding:0;background:#fff;width:297mm;font-family:sans-serif}}
 .page{{width:297mm;height:210mm;page-break-after:always;padding:10mm 15mm;display:flex;flex-direction:column;overflow:hidden}}
@@ -118,80 +184,103 @@ body{{margin:0;padding:0;background:#fff;width:297mm;font-family:sans-serif}}
 .grid{{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:10px;flex:1}}
 .card{{border:1px solid #d1d4dc;border-radius:6px;display:flex;flex-direction:column;overflow:hidden}}
 .card img{{width:100%;height:88%;object-fit:contain;background:#fafafa}}
-.card-label{{height:12%;text-align:center;font-size:11px;background:#f8f9fb;font-weight:bold;display:flex;align-items:center;justify-content:center;border-top:1px solid #d1d4dc}}
+.card-label{{height:12%;text-align:center;font-size:11px;background:#f8f9fb;display:flex;align-items:center;justify-content:center;border-top:1px solid #d1d4dc}}
 .cover{{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;border:2px solid #2962ff;margin:10px;border-radius:10px}}
 </style></head><body>
-<div class="page"><div class="cover"><h1 style="font-size:48px;color:#131722;margin-bottom:10px;">市场全景复盘报告</h1>
-<p style="font-size:20px;color:#666;margin-bottom:30px;">TradingView Automated Report</p>
-<div style="text-align:center;color:#999;font-size:14px;">生成时间:{now}<br>品种总数:{len(ss)}</div></div></div>
-<div class="page"><div class="symbol-title">报价概览(精简版)</div>
-<div style="flex:1;display:flex;align-items:flex-start;justify-content:center;overflow:hidden;padding-top:10px;">
-<img src="00_Watchlist_Quotes.png" style="height:100%;width:auto;max-width:450px;border:1px solid #d1d4dc;border-radius:4px;" onerror="this.style.display='none'"></div></div>
-{''.join(map(psec,ss))}</body></html>"""
-    p=os.path.join(BD,"pdf_template.html")
-    open(p,"w",encoding="utf-8").write(body);return p
+<!-- 封面 -->
+<div class="page"><div class="cover"><h1 style="font-size:48px;margin-bottom:10px;">市场复盘报告</h1><p style="font-size:20px;color:#666;">TradingView Automated Report</p><div style="color:#999;margin-top:20px;">生成时间: {now}</div></div></div>
 
-HL_ARGS=['--headless=new','--use-gl=swiftshader','--enable-webgl','--ignore-gpu-blocklist','--disable-gpu-sandbox']
-BASE_ARGS=['--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--no-sandbox']
+<!-- 新增：报价单概览页 -->
+<div class="page">
+    <div class="symbol-title">实时报价概览 (Watchlist)</div>
+    <div style="flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; padding:20px;">
+        <img src="00_Watchlist_Quotes.png" style="max-height:100%; border:1px solid #d1d4dc; border-radius:4px;" onerror="this.style.display='none'">
+    </div>
+</div>
 
-def launch(p,hl):
-    la=BASE_ARGS+(HL_ARGS if hl else [])
-    ctx=p.chromium.launch_persistent_context(UD,headless=False,args=la,viewport={'width':1920,'height':1080},device_scale_factor=2)
-    return ctx,ctx.pages[0] if ctx.pages else ctx.new_page()
+<!-- 品种详情页 -->
+{''.join(map(psec, ss))}
+</body></html>"""
 
-def cached_symbols():
-    if not os.path.exists(BD):return[]
-    ss=[d.replace("_",":",1) for d in os.listdir(BD) if os.path.isdir(os.path.join(BD,d))]
-    return sorted(ss)
+    tmp = os.path.join(BD, "pdf_template.html")
+    with open(tmp, "w", encoding="utf-8") as f: f.write(body)
 
-def export_pdf(ctx,ss):
-    print("🖨️ 正在导出 PDF...")
-    pp=phtml(ss);op=os.path.join(BD,f"Report_{datetime.now().strftime('%m%d_%H%M')}.pdf")
-    pg2=ctx.new_page();pg2.goto(f"file://{pp}",wait_until="networkidle");time.sleep(4)
-    pg2.pdf(path=op,format="A4",landscape=True,print_background=True)
-    print(f"🏁 PDF 已生成: {op}");webbrowser.open(f"file://{op}")
+    op = os.path.join(BD, f"Report_{datetime.now().strftime('%m%d_%H%M')}.pdf")
+    pg = await ctx.new_page()
+    await pg.goto(f"file://{os.path.abspath(tmp)}", wait_until="networkidle")
+    await asyncio.sleep(3)
+    await pg.pdf(path=op, format="A4", landscape=True, print_background=True)
+    await pg.close()
+    print(f"🏁 PDF 已生成: {op}")
+    webbrowser.open(f"file://{op}")
 
-def main():
-    ap=argparse.ArgumentParser(prog="tv",description="TradingView 自动复盘")
-    ap.add_argument("cmd",choices=["html","pdf","setup","clean"])
-    ap.add_argument("-H","--headless",action="store_true",help="无头模式")
-    ap.add_argument("--cache",action="store_true",help="使用本地截图缓存，跳过抓取")
-    a=ap.parse_args()
+# ================= 主程序 =================
 
-    t0=time.time()
-    if a.cmd=="clean":
-        [shutil.rmtree(d) for d in[UD,BD] if os.path.exists(d)];print("✅ 目录已清理。");return
-    os.makedirs(BD,exist_ok=True)
+async def main():
+    ap = argparse.ArgumentParser(prog="TV_Robot", description="TradingView 自动化截图工具")
+    ap.add_argument("cmd", choices=["run", "pdf", "setup", "clean"], help="操作命令")
+    ap.add_argument("-H", "--headless", action="store_true", help="启用无头模式")
+    a = ap.parse_args()
 
-    if a.cache:
-        ss=cached_symbols()
-        if not ss:print("❌ 本地无截图缓存，请先运行 make run 或 make run-hl。");return
-        print(f"📂 使用本地缓存，共 {len(ss)} 个品种")
-        if a.cmd=="pdf":
-            with sync_playwright() as p:
-                ctx,_=launch(p,a.headless);export_pdf(ctx,ss);ctx.close()
+    if a.cmd == "clean":
+        for d in [UD, BD]:
+            if os.path.exists(d): shutil.rmtree(d)
+        print("✅ 缓存及报告目录已清理。"); return
+
+    os.makedirs(BD, exist_ok=True)
+    t0 = asyncio.get_event_loop().time()
+
+    async with async_playwright() as p:
+        # 启动环境
+        la = BASE_ARGS + (HL_ARGS if a.headless else [])
+        ctx = await p.chromium.launch_persistent_context(
+            UD, headless=a.headless, args=la,
+            viewport={'width': 1920, 'height': 1080},
+            device_scale_factor=2
+        )
+        pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        if a.cmd == "setup":
+            print("💡 进入设置模式，请在浏览器中登录或调整图表布局。")
+            await pg.goto("https://www.tradingview.com/")
+            input("👉 完成调整后，在此处按回车退出...")
+            await ctx.close(); return
+
+        # 1. 获取列表
+        ss = await fetch(pg)
+        if not ss:
+            print("❌ 未能获取到品种，程序终止。"); await ctx.close(); return
+
+        # 2. 截取报价单
+        await shot_wl(pg, a.headless)
+
+        # 3. 异步并发截图
+        total_tasks = len(ss) * len(IV)
+        progress = Progress(total_tasks)
+        sem = asyncio.Semaphore(CONCURRENCY)
+        tasks = []
+
+        print(f"🚀 开始异步截图任务 (并发数: {CONCURRENCY})...")
+        for s in ss:
+            sf = os.path.join(BD, s.replace(":", "_"))
+            os.makedirs(sf, exist_ok=True)
+            for n, iv in IV.items():
+                tasks.append(shot_task(sem, ctx, s, n, iv, sf, a.headless, progress))
+
+        await asyncio.gather(*tasks)
+
+        # 4. 生成报告
+        rp_html = gen_html(ss)
+        print(f"🏁 HTML 报告已生成: {rp_html}")
+
+        if a.cmd == "pdf":
+            await export_pdf(ctx, ss)
         else:
-            rp=html(ss);print(f"🏁 Web报告已生成: {rp}");webbrowser.open(f"file://{rp}")
-        print(f"✨ 总耗时: {dur(int(time.time()-t0))}");return
+            webbrowser.open(f"file://{os.path.abspath(rp_html)}")
 
-    with sync_playwright() as p:
-        ctx,pg=launch(p,a.headless)
-        if a.cmd=="setup":
-            pg.goto("https://www.tradingview.com/",wait_until="domcontentloaded");input("💡 Setup: 调整好后回车...");ctx.close();return
-        ss=fetch(pg)
-        if not ss:ctx.close();return
-        shot_wl(pg,a.headless)
-        t1=time.time();total=len(ss)*len(IV)
-        for i,s in enumerate(ss):
-            sf=os.path.join(BD,s.replace(":","_"));os.makedirs(sf,exist_ok=True)
-            for j,(n,iv) in enumerate(IV.items()):
-                idx=i*len(IV)+j+1
-                print(f"📸 [{idx}/{total}] {s} / {n}")
-                shot(pg,s,n,iv,sf,a.headless,idx,total)
-        print(f"⏱️ 截图耗时: {dur(int(time.time()-t1))}")
-        if a.cmd=="pdf":export_pdf(ctx,ss)
-        else:rp=html(ss);print(f"🏁 Web报告已生成: {rp}");webbrowser.open(f"file://{rp}")
-        ctx.close()
-    print(f"✨ 总耗时: {dur(int(time.time()-t0))}")
+        await ctx.close()
 
-if __name__=="__main__":main()
+    print(f"✨ 任务全部完成，总耗时: {dur(int(asyncio.get_event_loop().time() - t0))}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
