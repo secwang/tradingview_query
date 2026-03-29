@@ -40,6 +40,7 @@ class Progress:
             if self.done == self.total: print("\n✨ 任务已完成")
 
 def bad(p):
+    """检查图片是否黑屏或加载失败"""
     try:
         if not os.path.exists(p) or os.path.getsize(p) < MF: return True
         with Image.open(p) as i:
@@ -54,6 +55,7 @@ def sym(h):
     return f"{q['exchange'][0]}:{t}" if 'exchange' in q else t.replace("-", ":", 1) if "-" in t else f"TVC:{t}"
 
 def to_b64(path):
+    """将图片转为 Base64 (PDF 生成必需)"""
     if not os.path.exists(path): return ""
     with open(path, "rb") as f:
         ext = path.split('.')[-1]
@@ -64,8 +66,10 @@ def to_b64(path):
 async def fetch(pg):
     print("📡 正在同步 Watchlist 列表...")
     await pg.goto(WL, wait_until="domcontentloaded", timeout=60000)
-    try: await pg.wait_for_selector('[data-qa-id="column-symbol"]', timeout=30000)
-    except: print("❌ 列表加载失败"); return []
+    try:
+        await pg.wait_for_selector('[data-qa-id="column-symbol"]', timeout=30000)
+    except:
+        print("❌ 列表加载超时"); return []
     await pg.mouse.wheel(0, 3000); await asyncio.sleep(2)
     elements = await pg.query_selector_all('[data-qa-id="column-symbol"] a')
     ss = [sym(await a.get_attribute("href")) for a in elements]
@@ -87,7 +91,8 @@ async def screenshot(pg, p, hl):
         bb = await loc.bounding_box()
         if bb: await pg.screenshot(path=p, clip=bb)
         else: await pg.screenshot(path=p)
-    else: await loc.screenshot(path=p)
+    else:
+        await loc.screenshot(path=p)
 
 async def shot_task(sem, ctx, s, n, iv, sf, hl, progress):
     async with sem:
@@ -97,17 +102,19 @@ async def shot_task(sem, ctx, s, n, iv, sf, hl, progress):
         try:
             for a in range(1, MR + 1):
                 try:
-                    await pg.goto(f"https://www.tradingview.com/chart/?symbol={s}&interval={iv}", wait_until="domcontentloaded", timeout=60000)
+                    await pg.goto(f"https://www.tradingview.com/chart/?symbol={s}&interval={iv}", 
+                                  wait_until="domcontentloaded", timeout=60000)
                     await wait_chart(pg, hl); await pg.mouse.move(10, 10)
                     await asyncio.sleep(get_wait(LW * a))
                     await screenshot(pg, p, hl)
                     if not bad(p): success = True; break
                 except: continue
             await progress.update(s, n, "✅" if success else "💀")
-        finally: await pg.close()
+        finally:
+            await pg.close()
 
 async def shot_wl(pg, hl):
-    print("📸 截取报价单概览...")
+    print("📸 截取实时报价单...")
     await pg.goto("https://www.tradingview.com/chart/", wait_until="domcontentloaded")
     await asyncio.sleep(10)
     try:
@@ -122,9 +129,10 @@ async def shot_wl(pg, hl):
         else: await pg.screenshot(path=out)
     except: pass
 
-# ================= 报告系统 =================
+# ================= 存档系统 (Monolith & PDF) =================
 
 def gen_local_html(ss, ts):
+    """生成 monolith 专用的本地 HTML 模板"""
     nav = ''.join(f'<a href="#{s.replace(":","")}">{s.split(":")[-1]}</a>' for s in ss)
     make_card = lambda s, n: f'<div class="card"><img src="{s.replace(":","_")}/{n}.png"><div class="card-label">{n}</div></div>'
     make_sec = lambda s: f'<div class="symbol-section" id="{s.replace(":","")}"><div class="symbol-title">{s}</div><div class="grid">{"".join(make_card(s, n) for n in IV)}</div></div>'
@@ -152,28 +160,40 @@ body{{font-family:'Inter',sans-serif;background:#f2f4f7;margin:0;padding:20px;co
 
 async def run_monolith(input_html, ts):
     out = os.path.join(AD, f"tv_{ts}.html")
-    print(f"📦 Monolith 打包存档...")
-    proc = await asyncio.create_subprocess_exec('monolith', input_html, '-o', out, '--no-video', '--quiet', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    print(f"📦 Monolith 正在打包存档 (包含字体)...")
+    proc = await asyncio.create_subprocess_exec('monolith', input_html, '-o', out, '--no-video', '--quiet', 
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0: return out
     print(f"❌ 打包失败: {stderr.decode()}"); return None
 
 async def export_pdf(ctx, ss, ts):
     out = os.path.join(AD, f"tv_{ts}.pdf")
-    print(f"🖨️ 导出 PDF...")
-    pcard = lambda sid, n: f'<div class="card"><img src="{to_b64(os.path.join(BD, sid, f"{n}.png"))}"><div class="card-label">{n}</div></div>'
-    psec = lambda s: f'<div class="page"><div class="symbol-title">{s}</div><div class="grid">{"".join(pcard(s.replace(":","_"),n) for n in IV)}</div></div>'
+    print(f"🖨️ 正在构建 PDF 报告 (包含封面和概览)...")
+    
+    wl_b64 = to_b64(os.path.join(BD, "00_Watchlist_Quotes.png"))
+    pcard = lambda sid, n: f'<div class="card"><img src="{to_b64(os.path.join(BD, sid, f"{n}.png"))}"><div class="card-label">{n} Chart</div></div>'
+    psec = lambda s: f'<div class="page"><div class="symbol-title">{s} 趋势全景</div><div class="grid">{"".join(pcard(s.replace(":","_"),n) for n in IV)}</div></div>'
+    
     body = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
-@page{{size:A4 landscape;margin:0}} body{{margin:0;padding:0;font-family:sans-serif;width:297mm}}
-.page{{width:297mm;height:210mm;page-break-after:always;padding:10mm;display:flex;flex-direction:column}}
-.symbol-title{{font-size:20px;color:#2962ff;font-weight:bold;margin-bottom:10px}}
+@page{{size:A4 landscape;margin:0}} *{{box-sizing:border-box}}
+body{{margin:0;padding:0;font-family:sans-serif;width:297mm;background:#fff}}
+.page{{width:297mm;height:210mm;page-break-after:always;padding:12mm;display:flex;flex-direction:column;overflow:hidden}}
+.cover{{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;border:2px solid #2962ff;margin:10px;border-radius:10px}}
+.symbol-title{{font-size:22px;color:#2962ff;border-left:5px solid #2962ff;padding-left:12px;margin-bottom:10px;font-weight:bold}}
 .grid{{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:10px;flex:1}}
-.card{{border:1px solid #ddd;display:flex;flex-direction:column;overflow:hidden}}
-.card img{{width:100%;height:85%;object-fit:contain;background:#fafafa}}
-.card-label{{height:15%;text-align:center;font-size:12px;background:#f8f9fb;display:flex;align-items:center;justify-content:center}}
-</style></head><body>{''.join(map(psec, ss))}</body></html>"""
+.card{{border:1px solid #ddd;border-radius:6px;display:flex;flex-direction:column;overflow:hidden}}
+.card img{{width:100%;height:88%;object-fit:contain;background:#fafafa}}
+.card-label{{height:12%;text-align:center;font-size:11px;background:#f8f9fb;display:flex;align-items:center;justify-content:center;border-top:1px solid #ddd}}
+</style></head><body>
+<div class="page"><div class="cover"><h1>市场复盘报告</h1><p>TradingView Automated Analysis</p><p style="color:#999">{datetime.now().strftime('%Y-%m-%d %H:%M')}</p></div></div>
+<div class="page"><div class="symbol-title">实时报价概览 (Watchlist)</div><div style="flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;"><img src="{wl_b64}" style="max-height:100%;border:1px solid #ddd;"></div></div>
+{''.join(map(psec, ss))}
+</body></html>"""
+
     tmp = os.path.join(BD, "pdf_tmp.html")
     with open(tmp, "w", encoding="utf-8") as f: f.write(body)
+    
     pg = await ctx.new_page()
     await pg.goto(f"file://{os.path.abspath(tmp)}", wait_until="networkidle")
     await pg.pdf(path=out, format="A4", landscape=True, print_background=True)
@@ -189,9 +209,9 @@ async def main():
     a = ap.parse_args()
 
     if a.cmd == "clean":
-        for d in [BD, AD]: 
+        for d in [BD, UD]: 
             if os.path.exists(d): shutil.rmtree(d)
-        print("✅ 已清理"); return
+        print("✅ 已清理存档和缓存"); return
 
     os.makedirs(BD, exist_ok=True); os.makedirs(AD, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
@@ -213,7 +233,8 @@ async def main():
             prog = Progress(len(ss)*len(IV)); sem = asyncio.Semaphore(CONCURRENCY); tasks = []
             for s in ss:
                 sf = os.path.join(BD, s.replace(":","_")); os.makedirs(sf, exist_ok=True)
-                for n, iv in IV.items(): tasks.append(shot_task(sem, ctx, s, n, iv, sf, a.headless, prog))
+                for n, iv in IV.items(): 
+                    tasks.append(shot_task(sem, ctx, s, n, iv, sf, a.headless, prog))
             await asyncio.gather(*tasks)
             with open(MF_FILE, "w") as f: json.dump({"symbols":ss, "ts":ts}, f)
         else:
@@ -222,7 +243,7 @@ async def main():
             else:
                 for i in os.listdir(BD): 
                     if os.path.isdir(os.path.join(BD,i)): ss.append(i.replace("_",":",1))
-            if not ss: print("❌ 无缓存"); await ctx.close(); return
+            if not ss: print("❌ 未找到有效缓存"); await ctx.close(); return
 
         if a.cmd == "html":
             tmp_h = gen_local_html(ss, ts)
@@ -233,7 +254,7 @@ async def main():
             if final: webbrowser.open(f"file://{final}")
 
         await ctx.close()
-    print(f"✨ 完成! 耗时: {dur(int(asyncio.get_event_loop().time()-t0))} | 存档: {AD}")
+    print(f"✨ 任务完成! 耗时: {dur(int(asyncio.get_event_loop().time()-t0))} | 存档目录: {AD}")
 
 if __name__ == "__main__":
     asyncio.run(main())
