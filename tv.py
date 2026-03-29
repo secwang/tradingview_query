@@ -209,7 +209,7 @@ async def main():
     a = ap.parse_args()
 
     if a.cmd == "clean":
-        for d in [BD, UD]: 
+        for d in [BD]: 
             if os.path.exists(d): shutil.rmtree(d)
         print("✅ 已清理存档和缓存"); return
 
